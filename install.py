@@ -66,7 +66,7 @@ def list_missing_extensions(shell: Shell, extensions: list[Path]) -> list[Path]:
 def install_extension(shell: Shell, extension: Path) -> None:
     # create a symbolic link from src/extension.py to klipper/klippy/extras/extension.py
     # so that updates in the repo automatically apply to klipper
-    extension.symlink_to(shell.klipper_extension_path().joinpath(extension.name))
+    shell.klipper_extension_path().joinpath(extension.name).symlink_to(extension)
 
 def remove_deleted_extensions(shell: Shell) -> None:
     # go through all extensions

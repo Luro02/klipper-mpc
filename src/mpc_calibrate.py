@@ -1,15 +1,40 @@
+# scp -r * lucas@printer.local:~/klipper-mpc
 import math
 
+import traceback
+import textwrap
+
 from enum import Enum, auto
-import numpy as np
+from .mpc_control import MPC, ControlMPC, ControlTemperature, DEFAULT_CYCLE_TIME, has_settled_at_target
 
-from .mpc_control import MPC, ControlMPC, ControlTemperature
-
-# TODO: use this function for finding t1, t2, t3
 def interp(x: float, fp: list[(float, float)]) -> float:
     xs, ys = zip(*fp)
 
-    return float(np.interp(x, xs, ys))
+    if len(xs) <= 1:
+        raise ValueError(f"Not enough values for interpolation: {xs}")
+
+    if not all(xs[i] < xs[i + 1] for i in range(len(xs) - 1)):
+        raise ValueError(f"the given x-coordinates are not sorted: {xs}")
+
+    # find the two closest xs to the x, where one is smaller than and the other is larger than x
+    previous_index = max((i for i in range(len(xs)) if xs[i] <= x), key=lambda i: xs[i], default=None)
+    next_index = min((i for i in range(len(xs)) if xs[i] >= x), key=lambda i: xs[i], default=None)
+
+    # if x is outside of the measured points:
+    if previous_index is None:
+        return float(ys[0])
+
+    if next_index is None:
+        return float(ys[-1])
+
+    # check if the value is in the measurements:
+    if previous_index == next_index:
+        return float(ys[previous_index])
+
+    (x0, y0) = (float(xs[previous_index]), float(ys[previous_index]))
+    (x1, y1) = (float(xs[next_index]), float(ys[next_index]))
+
+    return (y0 * (x1 - x) + y1 * (x - x0)) / (x1 - x0)
 
 class MPCTuningType(Enum):
     AUTO = auto()
@@ -33,25 +58,6 @@ class MPCCalibrate:
 
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('MPC_CALIBRATE', self.cmd_MPC_CALIBRATE, desc=self.cmd_MPC_CALIBRATE_help)
-        gcode.register_command('MPC_ENABLE', self.cmd_MPC_ENABLE, desc=self.cmd_MPC_CALIBRATE_help)
-
-    cmd_MPC_ENABLE_help = "Enable MPC algorithm for heating"
-    def cmd_MPC_ENABLE(self, gcmd):
-        heater_name = gcmd.get('HEATER', default="extruder")
-        
-        # find the options for the heater:
-        try:
-            mpc_section = self.printer.lookup_object('mpc').lookup_object(heater_name)
-        except self.printer.config_error as e:
-            raise gcmd.error(str(e))
-
-        self.printer.lookup_object('toolhead').get_last_move_time()
-
-        heater = mpc_section.heater
-
-        heater.set_control(ControlMPC(heater, mpc_section.config, mpc=mpc_section.mpc))
-
-        gcmd.respond_info(f"Enabled MPC for {mpc_section.heater_name}, restart klipper to disable it.")
 
     cmd_MPC_CALIBRATE_help = "Run MPC calibration test"
     def cmd_MPC_CALIBRATE(self, gcmd):
@@ -60,7 +66,6 @@ class MPCCalibrate:
         if heater_name != "extruder":
             target = gcmd.get_float('TARGET', default=200.0)
 
-        write_file = gcmd.get_int('WRITE_FILE', 0) == 1
         try:
             tuning_type = MPCTuningType.from_str(gcmd.get('TYPE', "auto"))
         except ValueError as e:
@@ -78,21 +83,9 @@ class MPCCalibrate:
         config = mpc_section.config
         mpc: MPC = mpc_section.mpc
 
-        # #define MPC_TUNING_POS { X_CENTER, Y_CENTER, 1.0f } // (mm) M306 Autotuning position, ideally bed center at first layer height.
-        # #define MPC_TUNING_END_Z 10.0f                      // (mm) M306 Autotuning final Z position.
-
-        # precondition for tuning is that the heater is off and part cooling fan as well:
-        # TODO: raise an error if the fan is on or just turn it off?
-
-        if heater_name == "extruder":
-            gcode = self.printer.lookup_object('gcode')
-            # TODO: make this position configurable?
-            gcode.run_script_from_command(f"G28\nG0 X128 Y128 Z1")
-
         (ambient_temp, target_temp) = heater.get_temp(eventtime)
         if target_temp > 0.:
-            # TODO: enable automatic cooldown
-            raise gcmd.error("Heater must be cold")
+            raise gcmd.error(f"Heater must be cold, target set to {target_temp}, but should be 0.")
 
         mpc.ambient_temp = ambient_temp
         pheaters = self.printer.lookup_object('heaters')
@@ -114,18 +107,15 @@ class MPCCalibrate:
             # Always restore the old_control algorithm (even if an error occurs):
             heater.set_control(old_control)
 
-        if write_file:
-            calibrate.write_file('/tmp/heattest.txt')
         if calibrate.check_busy(0., 0., 0.):
             raise gcmd.error("mpc_calibrate interrupted")
 
         # Save MPC values and report them on the command line:
         mpc.save(config, log=True)
 
-
 class ControlAutoTuneState(Enum):
     DETERMINE_AMBIENT_TEMPERATURE = auto()
-    DETERMINE_PHYSICAL_CONSTANTS = auto()
+    MEASURE_HEATING = auto()
     STABILIZE_SYSTEM = auto()
     DETERMINE_HEATLOSS = auto()
 
@@ -157,16 +147,7 @@ class ControlAutoTune:
         self.control_temp = ControlTemperature(self.printer, self.heater, fan=fan)
 
         self.heating = False
-        self.temp_samples = [0] * 16
-        self.sample_count = 0
-
-        # How often samples should be collected (in seconds)
-        self.test_sample_time = 1.0
-        # When the last temperature value has been read
-        self.next_test_time = 0.0
-        self.sample_distance = 1
-
-        self.measurements = []
+        self.settle_window = []
 
         self.state = ControlAutoTuneState.DETERMINE_AMBIENT_TEMPERATURE
 
@@ -174,17 +155,13 @@ class ControlAutoTune:
         self.control_temp.log(message)
 
     def determine_ambient_temperature(self, read_time, temp, target_temp):
-        # TODO: This code does not work reliably. It does not really cooldown the printer fully to ambient temperature
-        #       Cooling it down entirely could take forever as well. At least for testing, it makes sense to hardcode
-        #       a sensible default value like 25°C. The extruder must be below 100°C and for differential tuning it
-        #       should be even lower.
-
-        if self.mpc.ambient_temp < 30.0:
-            self.heater.alter_target(0.0)
-            self.state = self.state.next()
-            return
-
-        # if not already done, start cooldown
+        # When the printer is cooling down, it never reaches 0°C, but stops at
+        # around room temperature. This is called the ambient temperature.
+        #
+        # While the printer is cooling, one can only measure the temperature at
+        # the heater. The calibration code might be called while the printer
+        # is cooling down, so the measurement is not guranteed to be ambient
+        # temperature.
 
         # On the first call the target_temp, would be somewhere around ~200°C.
         # Before heating to that temperature, it is important to figure out the
@@ -193,62 +170,44 @@ class ControlAutoTune:
         # The target_temp is set by this method to 1°C, because then the heater fan
         # stays on. This speeds up finding the ambient temperature.
         if target_temp > 1.0:
+            # Assume the currently measured temperature is the ambient temp (if not it will later be replaced)
+            self.ambient_target = temp
+
             self.respond_info("Setting target temp to 1.0 for finding ambient temperature")
             self.heater.alter_target(1.)
-            # Indicate that we do not want to heat:
+
+            # indicate that it should not heat:
             self.control_temp.set_heater_pwm(read_time, 0.0)
 
-            # Measuring the ambient temperature every time this method is called, might result
-            # in the condition being true, because of sensor fluctuations. For example the
-            # current temperature could be 50.0°C, then on the next invocation the temperature
-            # is 50.1°C
-            # => 50.0°C is the lowest temperature, therefore it must be the room temperature
-            #
-            # To prevent this, only every second a measurement is done.
-            # This ensures that there is enough time for the fans to turn on.
-            self.next_measurement = read_time + 1.0
-
-            # enable fan for faster cooldown
+            # enable part cooling fan for faster cooldown
             self.control_temp.set_fan_speed(read_time, 1.0)
             return
 
-        if self.next_measurement > read_time:
-            return
 
-        # When the printer is cooling down, it never reaches 0°C, but stops at
-        # around room temperature. This is called the ambient temperature.
-        #
-        # While the printer is cooling, one only gets the current temperature. The
-        # next temperature could be even lower or not.
-        #
-        # To determine if ambient temperature is reached, self.mpc.ambient_temp
-        # is used to keep track of what the previous temperature was.
-
-        # When room temperature is reached, the current measurement should not be lower
-        # than the last measured temperature (otherwise that would be the ambient_temperature).
-        if temp >= self.mpc.ambient_temp or math.fabs(temp - self.mpc.ambient_temp) <= 0.2:
-            # The current measurement is slightly higher than the previously measured temperature.
-            # The middle of the two measurements will be used as the ambient temperature.
-            self.mpc.ambient_temp = (self.mpc.ambient_temp + temp) / 2.0
+        if has_settled_at_target(read_time, temp, self.ambient_target, self.settle_window, window_size=20, tolerance=0.2):
+            # ensure that the ambient temp is not above 30°C:
+            self.mpc.ambient_temp = min(self.ambient_target, 30.0, temp)
             self.control_temp.set_fan_speed(read_time, 0.0)
-            # advance to the next stage of the calibration:
+            # advance to the next state of the calibration:
             self.state = self.state.next()
             self.heater.alter_target(0.)
 
-            # ensure that the ambient temp is not above 30°C:
-            self.mpc.ambient_temp = min(self.mpc.ambient_temp, 30.0)
+            self.settle_window = []
 
             self.respond_info(f"Found ambient_temp={self.mpc.ambient_temp}")
-
             return
 
-        self.next_measurement = read_time + 1.0
+        # The measured temperature is lower than the targeted ambient temperature
+        # => use the middle between those values as new ambient target
+        if temp < self.ambient_target:
+            self.ambient_target = (self.ambient_target + temp) / 2.0
+
         self.mpc.ambient_temp = temp
 
-    def determine_physical_constants(self, read_time, temp, target_temp):
+    def measure_heating(self, read_time, temp, target_temp):
         # When this function is called, the printer is at ambient temperature (target set to 0):
         if target_temp == 0.0:
-            self.respond_info(f"Measuring physical constants...")
+            self.respond_info(f"Starting to measure heating")
             self.control_temp.set_heater_pwm(read_time, 1.0)
             self.heater.alter_target(self.calibrate_temp)
             self.heating = True
@@ -257,119 +216,71 @@ class ControlAutoTune:
             self.control_temp.start_recording(read_time)
             # record the time at which it started heating
             self.heat_start_time = read_time
-
-            # TODO: could these be removed?
-            self.temp_samples[0] = temp
-            self.temp_samples[1] = temp
-            self.temp_samples[2] = temp
-
-            self.time_fastest = 0.0
-            self.rate_fastest = 0.0
-            self.temp_fastest = 0.0
             return
 
-        # The marlin implementation only records a temperature sample every second
-        # and limits the total amount of samples to at most 16.
-        #
-        # This seems to be, because of memory constraints. This restriction does not
-        # apply to klippy, therefore all encountered samples are recorded.
-
-        # TODO: what happens when you disable this timer?
-        if read_time < self.next_test_time:
+        # if it did not reach the target temperature, continue measuring/heating
+        if temp < target_temp:
             return
 
-        self.next_test_time = read_time + self.test_sample_time
-
-        if temp < 100.0:
-            # Measure rate of change of heating for differential tuning
-
-            self.temp_samples[0] = self.temp_samples[1]
-            self.temp_samples[1] = self.temp_samples[2]
-            self.temp_samples[2] = temp
-
-            # Measure the rate of change of temperature, https://en.wikipedia.org/wiki/Symmetric_derivative
-            # TODO: test_sample_time might be wrong
-            # TODO: check unit of h, currently in seconds
-            h = self.test_sample_time
-            current_rate = (self.temp_samples[2] - self.temp_samples[0]) / (2.0 * h)
-
-            if current_rate > self.rate_fastest:
-                self.rate_fastest = current_rate
-                self.temp_fastest = self.temp_samples[1]
-                self.time_fastest = read_time - self.heat_start_time
-
-            return
-        elif temp < target_temp:
-            # Measure 3 points to determine asymptotic temperature
-
-            # If there are too many samples, space them more widely
-            if self.sample_count == len(self.temp_samples):
-                for i in range(len(self.temp_samples) // 2):
-                    self.temp_samples[i] = self.temp_samples[i * 2]
-                self.sample_count /= 2
-                self.sample_distance *= 2
-
-            if self.sample_count == 0:
-                self.t1_time = read_time - self.heat_start_time
-                self.control_temp.start_recording(self.t1_time + self.heat_start_time)
-                self.respond_info(f"t1_time = {self.t1_time}")
-
-            self.temp_samples[self.sample_count] = temp
-            self.sample_count += 1
-            self.t3_time = read_time - self.heat_start_time
-
-            self.next_test_time += self.test_sample_time * self.sample_distance
-
-            return
-
-        # finished collecting samples, can now calculate the physical constants:
-
-    	# TODO: one could use linear interpolation between the sample points and then define t1_time = 0, t2_time = end // 2, t3_time = end if even or end - 1 if odd
-        samples = self.control_temp.stop_recording(self.t1_time + self.heat_start_time)
-        # TODO: this contains every sample recorded since it started heating
-        self.control_temp.stop_recording(self.heat_start_time)
-        # TODO: is the recording correctly implemented?
+        # samples contains all recorded temperatures since it started heating:
+        samples = self.control_temp.stop_recording(self.heat_start_time)
+        self.respond_info(f"Samples: [{', '.join('(' + str(k) + ', ' + str(v) + ')' for (k, v) in samples)}]")
 
         self.respond_info("Finished collecting data for calculating constants. Temporarily setting pwm to 0.0")
         # turn off the heater
         self.control_temp.set_heater_pwm(read_time, 0.0)
         self.heating = False
 
-        self.respond_info(f"heat_start_time = {self.heat_start_time}")
+        # Three evenly spaced samples t1, t2 and t3 are required, with exactly delta time between them:
+        # t1_time + delta = t2_time
+        # t2_time + delta = t3_time
+        #
+        # If one calculates the delta as (t3_time - t1_time) / 2, the above might not hold, depending on what
+        # value delta is.
+        #
+        # Therefore the span is first rounded down to the nearest whole number, then it is adjusted to the next
+        # even number => there will be a whole number as delta
 
-        elapsed_heating_time = read_time - self.heat_start_time
+        first_phase = [(time, temp) for (time, temp) in samples if temp < 100.0]
+        second_phase = [(time, temp) for (time, temp) in samples if temp >= 100.0 and temp < 200.0]
 
-        self.respond_info(f"elapsed_heating_time = {elapsed_heating_time}")
+        # the first time it measured a temperature over 100.0
+        self.t1_time = second_phase[0][0]
+        self.respond_info(f"t1_time = {self.t1_time}")
 
-        if self.sample_count == 0:
-            # TODO: raise correct error
-            self.respond_info("Failed to collect samples")
-            raise ValueError("Failed to collect samples")
-        if self.sample_count % 2 == 0:
-            self.sample_count -= 1
+        last_sample = second_phase[-1]
+        time_span = math.floor(last_sample[0] - self.t1_time)
+        if time_span % 2 != 0:
+            time_span -= 1
+        delta = float(time_span / 2.0)
 
-        self.t1 = self.temp_samples[0]
-        self.t2 = self.temp_samples[(self.sample_count - 1) // 2]
-        self.t3 = self.temp_samples[self.sample_count - 1]
+        self.t2_time = delta + self.t1_time
+        self.t3_time = 2.0 * delta + self.t1_time
 
-        self.respond_info(f"t1={self.t1}, t2={self.t2}, t3={self.t3}")
-        elapsed_time = self.t3_time - self.t1_time
-        self.respond_info(f"elapsed_time={elapsed_time}")
+        self.t1 = interp(self.t1_time, samples)
+        self.t2 = interp(self.t2_time, samples)
+        self.t3 = interp(self.t3_time, samples)
 
         asymp_temp = (self.t2 * self.t2 - self.t1 * self.t3) / (2 * self.t2 - self.t1 - self.t3)
         # block_responsiveness = -log((t2 - asymp_temp) / (t1 - asymp_temp)) / tuner.get_sample_interval();
         # elapsed_time was (self.sample_distance * (self.sample_count // 2))
-        block_responsiveness = (-math.log((self.t3 - asymp_temp) / (self.t1 - asymp_temp))) / elapsed_time
+        block_responsiveness = (-math.log((self.t3 - asymp_temp) / (self.t1 - asymp_temp))) / (self.t3_time - self.t1_time)
+
+        self.respond_info(f"""The following data has been calculated from the samples:
+(t1_time, t1) = ({self.t1_time}, {self.t1})
+(t2_time, t2) = ({self.t2_time}, {self.t2})
+(t3_time, t3) = ({self.t3_time}, {self.t3})
+
+asymp_temp = {asymp_temp}
+block_responsiveness = {block_responsiveness}
+""")
+
 
         # Make initial guess at transfer coefficients
         ambient_xfer_coeff_fan0 = self.mpc.data.heater_power / (asymp_temp - self.mpc.ambient_temp)
-
         if self.tuning_type == MPCTuningType.AUTO or self.tuning_type == MPCTuningType.FORCE_ASYMPTOTIC:
             # Analytic tuning
             block_heat_capacity = ambient_xfer_coeff_fan0 / block_responsiveness
-            # TODO: most likely the * t1_time is wrong here!?
-            # TODO: ^ how does the corresponding formula look?
-            # TODO: if it is wrong, determine_heatloss code must be updated as well
             sensor_responsiveness = block_responsiveness / (1.0 - (self.mpc.ambient_temp - asymp_temp) * math.exp(-block_responsiveness * self.t1_time) / (self.t1 - asymp_temp))
 
             self.respond_info(f"block_heat_capacity={block_heat_capacity}\nsensor_responsiveness={sensor_responsiveness}")
@@ -380,11 +291,10 @@ class ControlAutoTune:
             self.respond_info("Analytic tuning failed, using different calibration method.")
 
         if self.tuning_type == MPCTuningType.FORCE_DIFFERENTIAL:
-            # differential tuning
-            block_heat_capacity = self.mpc.data.heater_power / self.rate_fastest
-            sensor_responsiveness = self.rate_fastest / (self.rate_fastest * self.time_fastest + self.mpc.ambient_temp - self.time_fastest)
+            (block_heat_capacity, sensor_responsiveness) = self.calculate_differential(first_phase)
 
-            self.respond_info(f"block_heat_capacity={block_heat_capacity}\nsensor_responsiveness={sensor_responsiveness}")
+        elapsed_heating_time = read_time - self.heat_start_time
+        self.respond_info(f"elapsed_heating_time = {elapsed_heating_time}")
 
         self.mpc.block_temp = asymp_temp + (self.mpc.ambient_temp - asymp_temp) * math.exp(-block_responsiveness * elapsed_heating_time)
         self.mpc.sensor_temp = temp
@@ -406,6 +316,49 @@ class ControlAutoTune:
         # Allow the system to stabilize under MPC, then get a better measure of ambient loss with and without fan
         self.state = self.state.next()
 
+    def calculate_differential(self, measurements: list[(float, float)]) -> (float, float):
+        temp_samples = [measurements[0][1], measurements[0][1], measurements[0][1]]
+        prev_time = 0.0
+
+        rate_fastest = 0.0
+        temp_fastest = 0.0
+        time_fastest = 0.0
+
+        for (read_time, temp) in measurements:
+            time_diff = read_time - prev_time
+
+            if prev_time == 0.0:
+                time_diff = DEFAULT_CYCLE_TIME
+
+            # Measure rate of change of heating for differential tuning
+            temp_samples[0] = temp_samples[1]
+            temp_samples[1] = temp_samples[2]
+            temp_samples[2] = temp
+
+            # Measure the rate of change of temperature, https://en.wikipedia.org/wiki/Symmetric_derivative
+            current_rate = (temp_samples[2] - temp_samples[0]) / (2.0 * time_diff)
+
+            if current_rate > rate_fastest:
+                rate_fastest = current_rate
+                temp_fastest = temp_samples[1]
+                time_fastest = read_time
+
+        # calculate the constants:
+
+        block_heat_capacity = self.mpc.data.heater_power / rate_fastest
+        sensor_responsiveness = rate_fastest / (rate_fastest * time_fastest + self.mpc.ambient_temp - time_fastest)
+
+        self.respond_info(
+            "differential tuning results:\n"
+            f"rate_fastest: {rate_fastest:.04f}\n"
+            f"temp_fastest: {temp_fastest:.04f}\n"
+            f"time_fastest: {time_fastest:.04f}\n"
+            f"block_heat_capacity: {block_heat_capacity:.04f}\n"
+            f"sensor_responsiveness: {sensor_responsiveness:.04f}\n"
+        )
+
+        return (block_heat_capacity, sensor_responsiveness)
+
     def stabilize_system(self, read_time, temp, target_temp):
         time_diff = read_time - self.mpc.prev_temp_time
         if not self.heating:
@@ -414,73 +367,140 @@ class ControlAutoTune:
             # control_mpc will set the pwm now:
             self.control_temp.set_heater_pwm(read_time, None)
 
-            # Use the estimated overshoot of the temperature as the target to achieve.
-            # TODO: error if it is not overshooting (happens when the ambient_temp is wrong)
+            # error if the calculated target is too high or too low:
+            if self.mpc.block_temp < self.calibrate_temp or self.mpc.block_temp >= self.heater.max_temp:
+                raise self.control_temp.error(f"the calculated target temperature '{self.mpc.block_temp}' must be greater than {self.calibrate_temp:.02f} and lower than {self.heater.max_temp:.02f}.")
+
+            # use the estimated overshoot of the temperature as the target to achieve
             self.heater.alter_target(self.mpc.block_temp)
 
-            self.next_test_time = read_time + time_diff
-            self.settle_time = 20.0 # in seconds
-            self.test_length = 20.0 # in seconds
+            # update the mpc values:
+            self.mpc.block_temp = temp
+            self.mpc.sensor_temp = temp
 
-            self.settle_end = read_time + self.settle_time
-            self.test_end = self.settle_end + self.test_length
+            self.wait_for_settle = True
+            self.max_sample_count = int(math.ceil(20.0 / time_diff))
+            self.sample_count = 0
 
             self.fan0_done = False
             self.total_energy_fan0 = 0.0
+            self.fan0_measurements = 0.0
             self.total_energy_fan255 = 0.0
+            self.fan255_measurements = 0.0
+
+            self.fan0_ambient_temp = 0.0
+            self.fan255_ambient_temp = 0.0
+            self.original_ambient_temp = self.mpc.ambient_temp
 
             self.last_temp = temp
+
+            self.settle_window = []
+            self.wait_until_time = None
 
             self.heater.set_pwm(read_time, 0.0)
             return
 
-        # Delegate to the current MPC algorithm:
+        # Delegate to the MPC algorithm:
         self.control_mpc.temperature_update(read_time, temp, target_temp)
 
-        # do nothing until the next test time is reached:
-        if read_time < self.next_test_time:
+        if self.wait_until_time is not None and read_time < self.wait_until_time:
             return
+        elif self.wait_until_time is not None and read_time >= self.wait_until_time:
+            self.wait_until_time = None
+
+        if self.wait_for_settle and not has_settled_at_target(read_time, temp, target_temp, self.settle_window, window_size=30, tolerance=0.1):
+            return
+        elif self.wait_for_settle:
+            self.respond_info(f"[{read_time:.3f}] Algorithm settled around target {target_temp:.2f}, starting measurements...")
+            self.wait_for_settle = False
+            self.settle_window = []
 
         heater_pwm = self.control_temp.get_heater_pwm()
 
-        if read_time >= self.settle_end and read_time < self.test_end and not self.fan0_done:
-            self.total_energy_fan0 += self.mpc.data.heater_power * heater_pwm * time_diff + (self.last_temp - temp) * self.mpc.data.block_heat_capacity
-        elif self.mpc.include_fan and read_time >= self.test_end and not self.fan0_done:
-            self.control_temp.set_fan_speed(read_time, 1.0)
-            self.settle_end = read_time + self.settle_time
-            self.test_end = self.settle_end + self.test_length
-            self.fan0_done = True
-        elif self.mpc.include_fan and read_time >= self.settle_end and read_time < self.test_end:
-            self.total_energy_fan255 += self.mpc.data.heater_power * heater_pwm * time_diff + (self.last_temp - temp) * self.mpc.data.block_heat_capacity
-        elif read_time >= self.test_end:
-            # calculate final values:
-            self.power_fan0 = self.total_energy_fan0 / self.test_length
-            self.power_fan255 = self.total_energy_fan255 / self.test_length
+        # This state uses the previously calculated values as base for the mpc control algorithm.
+        # It will heat to some target temperature and after some time has passed, it should stabilize
+        # around the target temperature.
+        #
+        # When it stabilized, there is some power percentage like 43% that will maintain the target
+        # temperature. This is measured in this test (power_fan0, when the fan is off
+        # and power_fan255 when it is on)
+
+        # Check if the test is over:
+        if self.sample_count >= self.max_sample_count and (self.fan0_done or not self.mpc.include_fan):
+            self.respond_info(f"[{read_time:.3f}] Finished measuring power requirements.")
+            # calculate how much power is required to maintain the target temperature with the fan on/off
+            self.power_fan0 = self.total_energy_fan0 / self.fan0_measurements
+
+            if self.fan255_measurements != 0.0:
+                self.power_fan255 = self.total_energy_fan255 / self.fan255_measurements
+            else:
+                self.power_fan255 = self.power_fan0
+
+            self.respond_info(f"[{read_time:.3f}] power_fan0 = {self.power_fan0:.03f}, power_fan255 = {self.power_fan255:.03f}")
+
+            # turn off the fan:
+            if self.mpc.include_fan:
+                self.control_temp.set_fan_speed(read_time, 0.0)
 
             self.respond_info(f"Finished stabilizing system. Now calculating final values.")
             self.state = self.state.next()
-
             return
 
+        if self.sample_count < self.max_sample_count and not self.fan0_done:
+            # original calculation:
+            # self.total_energy_fan0 += self.mpc.data.heater_power * heater_pwm * time_diff
+            #                        + (self.last_temp - temp) * self.mpc.data.block_heat_capacity
+            # where W * percentage * s + temp_diff °C * J/K
+            #
+            # self.total_energy_fan0 += self.mpc.data.heater_power * heater_pwm * time_diff + (self.last_temp - temp) * self.mpc.data.block_heat_capacity
+
+            # This calculates the average PWM value that is required to maintain the target temperature
+            # when the model has stabilized.
+            #
+            # TODO: how much of a difference is there, when you use the old formula?
+            self.total_energy_fan0 += self.mpc.data.heater_power * heater_pwm * time_diff + (self.last_temp - temp) * self.mpc.data.block_heat_capacity
+            self.fan0_measurements += time_diff
+            self.sample_count += 1
+            self.fan0_ambient_temp = self.mpc.ambient_temp
+        elif self.sample_count < self.max_sample_count and self.mpc.include_fan:
+            self.total_energy_fan255 += self.mpc.data.heater_power * heater_pwm * time_diff + (self.last_temp - temp) * self.mpc.data.block_heat_capacity
+            self.fan255_measurements += time_diff
+            self.sample_count += 1
+            self.fan255_ambient_temp = self.mpc.ambient_temp
+
+        if self.sample_count >= self.max_sample_count and self.mpc.include_fan and not self.fan0_done:
+            self.respond_info(f"[{read_time:.3f}] Now measuring power requirements with fan on.")
+            self.control_temp.set_fan_speed(read_time, 1.0)
+            self.fan0_done = True
+            self.wait_for_settle = True
+            self.settle_window = []
+            self.sample_count = 0
+            # it takes a bit of time for the fan to start spinning, wait a bit for the algorithm
+            # to take into account the fan:
+            self.wait_until_time = read_time + 20.0
+
         self.last_temp = temp
-        self.next_test_time += time_diff
 
     def determine_heatloss(self, read_time, temp, target_temp):
-        # TODO: should the heater be turned off?
-        # The heater is no longer required, therefore it is turned off
-        # self.control_temp.set_heater_pwm(read_time, 0.0)
-        # self.heater.alter_target(0.)
+        old_xfer = self.mpc.data.ambient_xfer_coeff_fan0
+        self.mpc.data.ambient_xfer_coeff_fan0 = self.power_fan0 / (target_temp - self.fan0_ambient_temp)
+        self.respond_info(f"fan0_ambient_temp = {self.fan0_ambient_temp:.05f}, ambient_temp = {self.mpc.ambient_temp:.05f}, original_ambient_temp = {self.original_ambient_temp:.05f}")
+        self.respond_info(f"ambient_xfer_coeff_fan0 = {self.mpc.data.ambient_xfer_coeff_fan0}")
+        self.mpc.data.ambient_xfer_coeff_fan0 = old_xfer * (target_temp - self.fan0_ambient_temp) / (target_temp - self.original_ambient_temp)
+        self.respond_info(f"ambient_xfer_coeff_fan0 = {self.mpc.data.ambient_xfer_coeff_fan0}")
 
-        self.mpc.data.ambient_xfer_coeff_fan0 = self.power_fan0 / (target_temp - self.mpc.ambient_temp)
         if self.mpc.include_fan:
+            # self.mpc.data.ambient_xfer_coeff_fan255 = self.power_fan255 / (target_temp - self.mpc.ambient_temp)
+            # self.mpc.data.ambient_xfer_coeff_fan255 = old_xfer * (target_temp - self.fan255_ambient_temp) / (target_temp - self.original_ambient_temp)
             self.mpc.data.ambient_xfer_coeff_fan255 = self.power_fan255 / (target_temp - self.mpc.ambient_temp)
+
+        # TODO: recalculate the constants?
 
         if self.tuning_type == MPCTuningType.AUTO or self.tuning_type == MPCTuningType.FORCE_ASYMPTOTIC:
             # Calculate a new and better asymptotic temperature and re-evaluate the other constants
 
             asymp_temp = self.mpc.ambient_temp + self.mpc.data.heater_power / self.mpc.data.ambient_xfer_coeff_fan0
-            elapsed_time = self.t3_time - self.t1_time
-            block_responsiveness = (-math.log((self.t3 - asymp_temp) / (self.t1 - asymp_temp))) / elapsed_time
+            block_responsiveness = (-math.log((self.t3 - asymp_temp) / (self.t1 - asymp_temp))) / (self.t3_time - self.t1_time)
 
             # Update analytic tuning values based on the above
             self.mpc.data.block_heat_capacity = self.mpc.data.ambient_xfer_coeff_fan0 / block_responsiveness
@@ -490,31 +510,75 @@ class ControlAutoTune:
         self.state = None
 
     def temperature_update(self, read_time, temp, target_temp):
-        self.control_temp.record(read_time, temp, target_temp)
-        if temp < 200.0 and temp > 100.0:
-            self.measurements.append((read_time, temp))
+        try:
+            self.control_temp.record(read_time, temp, target_temp)
+            states = {
+                ControlAutoTuneState.DETERMINE_AMBIENT_TEMPERATURE: self.determine_ambient_temperature,
+                ControlAutoTuneState.MEASURE_HEATING: self.measure_heating,
+                ControlAutoTuneState.STABILIZE_SYSTEM: self.stabilize_system,
+                ControlAutoTuneState.DETERMINE_HEATLOSS: self.determine_heatloss,
+            }
 
-        states = {
-            ControlAutoTuneState.DETERMINE_AMBIENT_TEMPERATURE: self.determine_ambient_temperature,
-            ControlAutoTuneState.DETERMINE_PHYSICAL_CONSTANTS: self.determine_physical_constants,
-            ControlAutoTuneState.STABILIZE_SYSTEM: self.stabilize_system,
-            ControlAutoTuneState.DETERMINE_HEATLOSS: self.determine_heatloss,
-        }
+            # The time_diff is used in multiple calculations. When the prev_temp_time is 0.0,
+            # the script has not been run before. This could result in wrong calculations, therefore
+            # it is manually set to 0.3s in the past (how long a klipper cycle takes).
+            if self.mpc.prev_temp_time == 0.0:
+                self.mpc.prev_temp_time = max(0.0, read_time - DEFAULT_CYCLE_TIME)
 
-        if self.state is not None:
-            states[self.state](read_time, temp, target_temp)
+            if self.state is not None:
+                states[self.state](read_time, temp, target_temp)
+                self.mpc.prev_temp_time = read_time
 
-            self.mpc.prev_temp_time = read_time
+            self.control_temp.update_heater(read_time, temp, target_temp)
+        except Exception as e:
+            # Coding mistakes that result in a crash can happen.
+            #
+            # For some reason klippy does not forcibly turn off the printer,
+            # instead the exception will be logged and everything resumes like
+            # nothing happend. You might not even be aware that something has
+            # crashed.
+            #
+            # This is very dangerous. For example an exception could be raised
+            # while the printer is currently heating up. There will be nothing
+            # to stop the printer from continuing to heat.
+            #
+            # TODO: add this to mpc_control as well?
+            # TODO: how about limiting the message size so it fits comfortably in the console?
+            def wrap_line(line: str) -> list[str]:
+                return textwrap.wrap(line, width=52, tabsize=4, replace_whitespace=False, break_long_words=False)
 
-        self.control_temp.update_heater(read_time, temp, target_temp)
+            def wrap_multiline(lines: list[str]) -> str:
+                result = []
+
+                current = ""
+                for line in lines:
+                    if len(line.strip()) == 0:
+                        if len(current) > 0:
+                            result.extend(wrap_line(current))
+                            current = ""
+
+                        result.append("")
+                    else:
+                        if len(current) == 0:
+                            current = line.strip()
+                        else:
+                            current += " " + line.strip()
+
+                if len(current) > 0:
+                    result.extend(wrap_line(current))
+
+                return '\n'.join(result)
+
+            short_message = f"error: {str(e)}"
+            message = traceback.format_exc()
+            self.respond_info(wrap_multiline(message.splitlines()))
+
+            self.printer.invoke_shutdown(short_message)
+            raise self.printer.command_error(str(e))
+
 
     def check_busy(self, eventtime, smoothed_temp, target_temp):
         return self.state is not None
-
-    # Offline analysis helper
-    def write_file(self, filename):
-        with open(filename, "w") as fd:
-            fd.writelines([f"{k}={v}\n" for (k, v) in self.measurements])
 
 def load_config(config):
     return MPCCalibrate(config)

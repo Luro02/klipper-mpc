@@ -4,6 +4,19 @@ import math
 from dataclasses import dataclass, fields, MISSING
 from typing import Optional
 
+DEFAULT_CYCLE_TIME = 0.3
+DEFAULT_AMBIENT_TEMP = 25.0
+
+def has_settled_at_target(read_time: float, temp: float, target_temp: float, window: list[(float, float)], window_size: int = 15, tolerance: float = 0.2) -> bool:
+    window.append((read_time, temp))
+
+    while len(window) > window_size:
+        # remove the oldest temperature measurement
+        window.pop(0)
+
+    return len(window) == window_size and all([math.fabs(target_temp - temp) < tolerance for (_, temp) in window])
+
+
 # This class keeps track of relevant data for the other classes that rely on this.
 class ControlTemperature:
     last_heater_pwm: Optional[float]
@@ -19,11 +32,14 @@ class ControlTemperature:
 
     _temp_records: list[(float, float)]
 
-    def __init__(self, printer, heater, fan = None) -> None:
+    is_debug: bool
+
+    def __init__(self, printer, heater, fan = None, is_debug = True) -> None:
         self.printer = printer
         self.heater = heater
         self.heater_max_power = float(heater.get_max_power())
         self.fan = fan
+        self.is_debug = is_debug
 
         self.gcode = self.printer.lookup_object('gcode')
 
@@ -59,21 +75,44 @@ class ControlTemperature:
         return records
 
     def error(self, message: str):
-        # TODO: decide on better way to error?
         return self.printer.config_error(message)
 
-    def log(self, message: str) -> None:
+    def info(self, message: str) -> None:
+        """
+        Prints an info message for the user to console.
+
+        If the console is not accessible, it will write a log instead.
+        The message is printed, even if the debug logs are disabled.
+
+        :param message: the message as a string that should be printed, can be over multiple lines
+        """
         if self.gcode is not None:
             self.gcode.respond_info(message)
+        else:
+            # respond_info messages are automatically logged, therefore only write logs
+            # if it did not print
+            logging.info(message)
 
-        logging.info(message)
+    def log(self, message: str) -> None:
+        if self.gcode is not None and self.is_debug:
+            self.gcode.respond_info(message)
+        else:
+            # respond_info messages are automatically logged, therefore only write logs
+            # if it did not print
+            logging.debug(message)
 
     def ensure_within_range(self, value: float, start: float, end: float, context: str):
         if value < start or value > end:
             raise self.error(f"{context}: The value '{value}' must be in range [{start}, {end}]")
 
-    # returns a percentage between 0.0 and 1.0, where 0.0 = off and 1.0 = maximum speed
     def get_fan_speed(self) -> float:
+        """
+        Returns the fan speed of the part cooling fan.
+
+        If the fan is None, an exception will be raised.
+
+        :returns: a value between 0.0 and 1.0, where 0.0 = off and 1.0 = maximum speed
+        """
         return float(self.fan.last_fan_value)
 
     def set_fan_speed(self, time: float, value: float):
@@ -124,7 +163,7 @@ class MPC:
     include_fan: bool
 
     # Model Data:
-    
+
     ambient_temp: float
     block_temp: float
     sensor_temp: float
@@ -146,7 +185,7 @@ class MPC:
     @classmethod
     def from_config(cls, config, **kwargs) -> "MPC":
         args = dict(kwargs)
-        
+
         include_fan = args.pop('include_fan', None)
         if include_fan is None:
             include_fan = config.getboolean('include_fan', default=True)
@@ -155,12 +194,21 @@ class MPC:
 
         return cls(data, include_fan)
 
+    def update(self, **kwargs):
+        args = dict(kwargs)
+
+        include_fan = args.pop('include_fan', None)
+        if include_fan is not None:
+            self.include_fan = bool(include_fan)
+
+        self.data.update(**args)
+
     def save(self, config, log=False):
         self.data.save(config, log=log)
 
     def __str__(self) -> str:
         attrs = [(attr, getattr(self, attr)) for attr in dir(self) if not callable(getattr(self, attr)) and not attr.startswith("__")]
-        
+
         return f"{self.__class__.__name__}({', '.join([f'{name}={value}' for (name, value) in attrs])})"
 
 @dataclass
@@ -175,6 +223,8 @@ class MPCData:
     ambient_xfer_coeff_fan0: float = 0.0
     # (W/K) Heat transfer coefficients from heat block to room air with fan on full.
     ambient_xfer_coeff_fan255: Optional[float] = None
+
+    # TODO: save fan_coeff instead?
 
     # Advanced options, all of them have fallbacks:
 
@@ -210,8 +260,15 @@ class MPCData:
                     args[option] = field.default
                 else:
                     raise config.error(f"missing value for option '{option}' in config section '{config.get_name()}'")
+        result = cls(**args)
+        # keep the original values to compare for changes (=> only changed values should be saved)
+        result.config_values = dict(args)
 
-        return cls(**args)
+        return result
+
+    def update(self, **kwargs):
+        for (field, value) in dict(kwargs):
+            setattr(self, field, float(value))
 
     def fan255_adjustment(self):
         if self.ambient_xfer_coeff_fan255 is None:
@@ -229,6 +286,10 @@ class MPCData:
         values = [(field.name, f"{getattr(self, field.name):.5f}") for field in fields(self)]
 
         for (option, value) in values:
+            # do not overwrite values that have not changed:
+            if option in self.config_values and f"{self.config_values[option]:.5f}" == value:
+                continue
+
             configfile.set(section_name, option, value)
 
 
@@ -244,13 +305,16 @@ class MPCData:
 
 class ControlMPC:
     mpc: MPC
+    settle_window: list[(float, float)]
 
     def __init__(self, heater, config, mpc: Optional[MPC] = None):
         self.printer = config.get_printer()
         self.toolhead = self.printer.lookup_object('toolhead')
- 
+
         self.heater = heater
         self.heater_max_power = heater.get_max_power()
+
+        self.settle_window = []
 
         self.mpc = mpc or MPC.from_config(config)
 
@@ -269,8 +333,8 @@ class ControlMPC:
             fan = printer_fan.fan
 
         self.next_output_time = 0.0
-        self.control_temp = ControlTemperature(self.printer, self.heater, fan=fan)
-        self.control_temp.last_heater_pwm = 0.0
+        self.control = ControlTemperature(self.printer, self.heater, fan=fan)
+        self.control.last_heater_pwm = 0.0
 
     # TODO: ensure that this is correct?
     def steps_to_mm(self, steps: float) -> float:
@@ -284,7 +348,7 @@ class ControlMPC:
         return step_dist * steps
 
     def max_e_velocity(self) -> float:
-        return self.toolhead.get_extruder().max_e_velocity 
+        return self.toolhead.get_extruder().max_e_velocity
 
     def _internal_temperature_update(self, read_time, temp, target_temp):
         time_diff = read_time - self.mpc.prev_temp_time
@@ -294,8 +358,7 @@ class ControlMPC:
         #
         # To prevent this, the time_diff is set to a fixed number for the first update.
         if self.mpc.prev_temp_time == 0.0:
-            # the temperature_update is called every 0.3s
-            time_diff = 0.3
+            time_diff = DEFAULT_CYCLE_TIME
 
         # initialize model temperatures on first call:
         if self.mpc.block_temp is None:
@@ -308,7 +371,7 @@ class ControlMPC:
         ambient_xfer_coeff = self.mpc.data.ambient_xfer_coeff_fan0
 
         if self.mpc.include_fan:
-            ambient_xfer_coeff += self.control_temp.get_fan_speed() * self.mpc.data.fan255_adjustment()
+            ambient_xfer_coeff += self.control.get_fan_speed() * self.mpc.data.fan255_adjustment()
 
         # this should be an extruder object from kinematics, a PrinterExtruder
         printer_extruder = self.toolhead.get_extruder()
@@ -325,7 +388,7 @@ class ControlMPC:
             ambient_xfer_coeff += e_speed * self.mpc.data.filament_heat_capacity
             self.mpc.last_e_position = e_position
 
-        last_pwm_value = self.control_temp.get_heater_pwm()
+        last_pwm_value = self.control.get_heater_pwm()
 
         # update the modeled temperatures
         blocktempdelta = last_pwm_value * self.mpc.data.heater_power * time_diff / self.mpc.data.block_heat_capacity
@@ -377,19 +440,28 @@ class ControlMPC:
         pid_output = max(0.0, min(1.0, power / self.mpc.data.heater_power))
 
         if read_time > self.next_output_time:
-            self.control_temp.log(f"MPC Control: ({read_time}, {temp}, {target_temp}): {last_pwm_value} -> {pid_output}, {self.mpc}")
+            self.control.log((
+                "MPC Status:\n"
+                f"read_time: {read_time}\n"
+                f"temp: {temp}\n"
+                f"target_temp: {target_temp}\n"
+                f"pid_output: {pid_output}\n"
+                f"\n"
+                f"ambient_temp: {self.mpc.ambient_temp}\n"
+                f"block_temp: {self.mpc.block_temp}\n"
+                f"sensor_temp: {self.mpc.sensor_temp}\n"
+            ))
             self.next_output_time = read_time + 1.0
 
-        self.control_temp.set_heater_pwm(read_time, pid_output)
+        self.control.set_heater_pwm(read_time, pid_output)
 
     def temperature_update(self, read_time, temp, target_temp):
-        self.control_temp.record(read_time, temp, target_temp)
-        
+        self.control.record(read_time, temp, target_temp)
+
         self._internal_temperature_update(read_time, temp, target_temp)
-        
-        self.control_temp.update_heater(read_time, temp, target_temp)
+
+        self.control.update_heater(read_time, temp, target_temp)
         self.mpc.prev_temp_time = read_time
 
     def check_busy(self, eventtime, smoothed_temp, target_temp):
-        temp_diff = target_temp - smoothed_temp
-        return math.fabs(temp_diff) < 1.0
+        return has_settled_at_target(eventtime, smoothed_temp, target_temp, self.settle_window, tolerance=0.1)
